@@ -5,8 +5,7 @@ scout_master.csv
 # Python
 __pycache__/
 *.pyc
-.venv/
-.env
+venv/
 
 # Streamlit
 .streamlit/
