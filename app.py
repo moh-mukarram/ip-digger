@@ -4,6 +4,8 @@ import os
 import downloader
 import forensics
 import logic
+import review_exporter
+import review_auto_enricher
 import time
 import math
 
@@ -183,8 +185,73 @@ if os.path.exists(MASTER_CSV):
             if sort_keys:
                  view_df = view_df.sort_values(by=sort_keys, ascending=sort_dirs)
             
-            st.dataframe(view_df, width="stretch")
+            # --- Add BGP WHOIS Link ---
+            # Generate URL: https://bgp.he.net/ip/<IP>#_whois
+            if 'Prefix' in view_df.columns:
+                view_df['whois_url'] = view_df['Prefix'].apply(
+                    lambda x: f"https://bgp.he.net/ip/{x.split('/')[0]}#_whois" if isinstance(x, str) else None
+                )
+            
+            # --- Selection UI ---
+            view_df.insert(0, "Select", False)
+
+            edited_df = st.data_editor(
+                view_df, 
+                width="stretch",
+                column_config={
+                    "whois_url": st.column_config.LinkColumn(
+                        "BGP WHOIS",
+                        display_text="WHOIS"
+                    ),
+                    "Select": st.column_config.CheckboxColumn(
+                        "Select",
+                        help="Select for Manual Review Export",
+                        default=False,
+                    )
+                },
+                disabled=[c for c in view_df.columns if c != "Select"],
+                hide_index=True
+            )
             st.caption(f"Showing {len(view_df)} rows")
+            
+            # --- Export Action ---
+            st.markdown("### Actions")
+            c1, c2 = st.columns(2)
+            
+            with c1:
+                if st.button("Generate Review JSON (max 5)"):
+                    selected_rows = edited_df[edited_df['Select'] == True]
+                    count = len(selected_rows)
+                    
+                    if count == 0:
+                        st.warning("No rows selected.")
+                    elif count > 5:
+                        st.error(f"Selection Limit Exceeded. You selected {count} rows (Max: 5).")
+                    else:
+                        rows_data = selected_rows.to_dict('records')
+                        try:
+                            files = review_exporter.export_review_batch(rows_data)
+                            st.success(f"Generated {len(files)} skeleton files.")
+                        except Exception as e:
+                            st.error(f"Export failed: {e}")
+                            
+            with c2:
+                if st.button("Auto Review Selected Prefixes (max 5)"):
+                    selected_rows = edited_df[edited_df['Select'] == True]
+                    count = len(selected_rows)
+                    
+                    if count == 0:
+                        st.warning("No rows selected.")
+                    elif count > 5:
+                        st.error(f"Selection Limit Exceeded. You selected {count} rows (Max: 5).")
+                    else:
+                        rows_data = selected_rows.to_dict('records')
+                        try:
+                            # Calls the auto enricher
+                            files = review_auto_enricher.auto_enrich_batch(rows_data)
+                            st.success(f"Enriched {len(files)} files with API data.")
+                        except Exception as e:
+                            st.error(f"Enrichment failed: {e}")
             
         with tab2:
             st.subheader("Teaser Generator")
