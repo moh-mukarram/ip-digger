@@ -1,13 +1,15 @@
 import streamlit as st
 import pandas as pd
 import os
+import threading
+import time
+import math
+from datetime import timedelta
 import downloader
 import forensics
 import logic
 import review_exporter
 import review_auto_enricher
-import time
-import math
 
 # --- Configuration ---
 MASTER_CSV = "scout_master.csv"
@@ -37,21 +39,264 @@ if 'sort_col_2' not in st.session_state:
 if 'sort_asc_2' not in st.session_state:
     st.session_state.sort_asc_2 = False
 
+# --- Progress Tracking System ---
+
+class ProgressManager:
+    """Thread-safe singleton to track job progress."""
+    def __init__(self, mode="Unknown"):
+        self.lock = threading.Lock()
+        self.mode = mode
+        self.status_text = "Initializing..."
+        self.processed_count = 0
+        self.total_count = 0
+        self.start_time = time.time()
+        self.batch_current = 0
+        self.batch_total = 0
+        self.error = None
+        self.result = None
+        self.completed = False
+
+    def update_status(self, text):
+        with self.lock:
+            self.status_text = text
+
+    def set_total(self, total, batch_total=0):
+        with self.lock:
+            self.total_count = total
+            self.batch_total = batch_total
+
+    def increment_processed(self):
+        with self.lock:
+            self.processed_count += 1
+            
+    def increment_batch(self):
+        with self.lock:
+            self.batch_current += 1
+
+    def set_error(self, err):
+        with self.lock:
+            self.error = err
+            self.completed = True
+
+    def set_result(self, res):
+        with self.lock:
+            self.result = res
+            self.completed = True
+
+    def get_snapshot(self):
+        with self.lock:
+            elapsed = time.time() - self.start_time
+            return {
+                "mode": self.mode,
+                "status": self.status_text,
+                "processed": self.processed_count,
+                "total": self.total_count,
+                "batch_current": self.batch_current,
+                "batch_total": self.batch_total,
+                "elapsed": elapsed,
+                "completed": self.completed,
+                "error": self.error,
+                "result": self.result
+            }
+
+class HookContext:
+    """Context Manager to safely patch and restore backend functions."""
+    def __init__(self, job_func, tracker, **kwargs):
+        self.tracker = tracker
+        self.job_func = job_func
+        self.kwargs = kwargs
+        self.original_funcs = {}
+        self.patched = False
+
+    def __enter__(self):
+        # Identify Job Type based on module
+        module_name = self.job_func.__module__
+        
+        if module_name == 'downloader':
+            self.tracker.mode = "Ingestion"
+            self._patch_downloader()
+        elif module_name == 'forensics':
+            self.tracker.mode = "Forensics"
+            self._patch_forensics()
+        elif module_name == 'logic':
+            self.tracker.mode = "Logic"
+            self._patch_logic()
+        
+        self.patched = True
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            self._restore()
+        except Exception as e:
+            print(f"Error restoring hooks: {e}")
+
+    def _patch_downloader(self):
+        # Patch fetch
+        self.original_funcs['fetch'] = downloader.fetch_apnic_data
+        def hook_fetch(*args, **k):
+            self.tracker.update_status("Downloading APNIC Data...")
+            return self.original_funcs['fetch'](*args, **k)
+        downloader.fetch_apnic_data = hook_fetch
+
+        # Patch parse
+        self.original_funcs['parse'] = downloader.parse_apnic_data
+        def hook_parse(*args, **k):
+            self.tracker.update_status("Parsing and Filtering Candidates...")
+            res = self.original_funcs['parse'](*args, **k)
+            if res:
+                self.tracker.set_total(len(res)) # Found candidates
+            return res
+        downloader.parse_apnic_data = hook_parse
+        
+        # Patch save
+        self.original_funcs['save'] = downloader.save_master_db
+        def hook_save(*args, **k):
+            self.tracker.update_status("Saving Master Database...")
+            return self.original_funcs['save'](*args, **k)
+        downloader.save_master_db = hook_save
+
+    def _patch_forensics(self):
+        # Pre-calculate counts from CSV
+        try:
+            if os.path.exists(MASTER_CSV):
+                df = pd.read_csv(MASTER_CSV)
+                pending = len(df[df['Status_Label'] == 'Pending'])
+                self.tracker.set_total(pending)
+                batch_size = self.kwargs.get('batch_size', 50)
+                if batch_size > 0:
+                    self.tracker.batch_total = math.ceil(pending / batch_size)
+        except:
+            pass
+
+        # Patch analyze (Thread-safe)
+        self.original_funcs['analyze'] = forensics.analyze_prefix
+        def hook_analyze(*args, **k):
+            # No status update here to avoid spamming lock, just count
+            res = self.original_funcs['analyze'](*args, **k)
+            self.tracker.increment_processed()
+            return res
+        forensics.analyze_prefix = hook_analyze
+        
+        # Patch save (Batch end)
+        self.original_funcs['save'] = forensics.save_master_db
+        def hook_save(*args, **k):
+            self.tracker.increment_batch()
+            # Calculate current batch index for display
+            b_cur = self.tracker.batch_current
+            b_tot = self.tracker.batch_total
+            # Update text
+            self.tracker.update_status(f"Saving Batch {b_cur}/{b_tot}")
+            return self.original_funcs['save'](*args, **k)
+        forensics.save_master_db = hook_save
+
+    def _patch_logic(self):
+        # Pre-calc
+        try:
+            if os.path.exists(MASTER_CSV):
+                df = pd.read_csv(MASTER_CSV)
+                # Logic processes non-pending (roughly)
+                count = len(df[df['Status_Label'] != 'Pending'])
+                self.tracker.set_total(count)
+        except:
+            pass
+
+        # Patch generic calculation
+        self.original_funcs['calc'] = logic.calculate_score_and_status
+        def hook_calc(*args, **k):
+            res = self.original_funcs['calc'](*args, **k)
+            self.tracker.increment_processed()
+            # Optional: Throttle status updates
+            if self.tracker.processed_count % 50 == 0:
+                 self.tracker.update_status(f"Scoring row {self.tracker.processed_count}...")
+            return res
+        logic.calculate_score_and_status = hook_calc
+        
+    def _restore(self):
+        if not self.patched: return
+        # Restore functions
+        if 'fetch' in self.original_funcs: downloader.fetch_apnic_data = self.original_funcs['fetch']
+        if 'parse' in self.original_funcs: downloader.parse_apnic_data = self.original_funcs['parse']
+        if 'save' in self.original_funcs:
+            if self.tracker.mode == "Ingestion": downloader.save_master_db = self.original_funcs['save']
+            elif self.tracker.mode == "Forensics": forensics.save_master_db = self.original_funcs['save']
+        
+        if 'analyze' in self.original_funcs: forensics.analyze_prefix = self.original_funcs['analyze']
+        if 'calc' in self.original_funcs: logic.calculate_score_and_status = self.original_funcs['calc']
+
+
+def job_thread_target(job_func, tracker, *args, **kwargs):
+    """Execution target for the background thread."""
+    try:
+        with HookContext(job_func, tracker, **kwargs):
+            res = job_func(*args, **kwargs)
+            tracker.set_result(res)
+    except Exception as e:
+        tracker.set_error(e)
+
 def run_job_wrapper(job_func, *args, **kwargs):
     """
-    Wrapper to handle job execution with UI locking.
+    Wrapper to handle job execution with UI locking and Dynamic Progress.
     """
     st.session_state.job_running = True
-    try:
-        with st.spinner("Processing..."):
-            result = job_func(*args, **kwargs)
-            st.session_state.last_status = f"Success: {result if result else 'Completed'}"
-            st.success("Job Completed Successfully")
-    except Exception as e:
-        st.session_state.last_status = f"Error: {str(e)}"
-        st.error(f"Job Failed: {e}")
-    finally:
-        st.session_state.job_running = False
+    
+    # Initialize Progress Tracking
+    tracker = ProgressManager()
+    
+    # Progress UI Containers
+    ui_status = st.empty()
+    ui_bar = st.empty()
+    ui_stats = st.empty()
+    
+    # Start Thread
+    t = threading.Thread(target=job_thread_target, args=(job_func, tracker) + args, kwargs=kwargs)
+    t.start()
+    
+    # Monitor Loop
+    while t.is_alive():
+        snap = tracker.get_snapshot()
+        
+        # Display Logic
+        elapsed_str = str(timedelta(seconds=int(snap['elapsed'])))
+        
+        if snap['mode'] == "Forensics":
+            # Forensics Batch 3 of 18 – 150 of 900 prefixes processed – Elapsed 02:41
+            msg = f"Forensics Batch {snap['batch_current']} of {snap['batch_total']} – {snap['processed']} of {snap['total']} prefixes processed – Elapsed {elapsed_str}"
+            current_pct = snap['processed'] / snap['total'] if snap['total'] > 0 else 0
+        elif snap['mode'] == "Logic":
+            msg = f"Logic Processing – {snap['processed']} of {snap['total']} rows – Elapsed {elapsed_str}"
+            current_pct = snap['processed'] / snap['total'] if snap['total'] > 0 else 0
+        else:
+            # Ingestion
+            msg = f"{snap['mode']}: {snap['status']} – Elapsed {elapsed_str}"
+            current_pct = 0 # Indeterminate
+            
+        ui_status.markdown(f"**{msg}**")
+        if snap['total'] > 0:
+            ui_bar.progress(min(current_pct, 1.0))
+        else:
+            ui_bar.progress(0)
+            
+        time.sleep(0.5)
+        
+    # Job Done
+    t.join()
+    snap = tracker.get_snapshot()
+    
+    # Final UI Cleanup
+    ui_bar.empty()
+    ui_stats.empty()
+    
+    if snap['error']:
+        st.session_state.last_status = f"Error: {str(snap['error'])}"
+        ui_status.error(f"Job Failed: {snap['error']}")
+    else:
+        # Success
+        result_str = str(snap['result']) if snap['result'] else "Completed"
+        st.session_state.last_status = f"Success: {result_str}"
+        ui_status.success(f"Job Completed: {result_str} (Duration: {str(timedelta(seconds=int(snap['elapsed'])))})")
+    
+    st.session_state.job_running = False
 
 # --- Sidebar Controls ---
 st.sidebar.title("Operator Controls")
