@@ -183,7 +183,23 @@ if os.path.exists(MASTER_CSV):
             if sort_keys:
                  view_df = view_df.sort_values(by=sort_keys, ascending=sort_dirs)
             
-            st.dataframe(view_df, width="stretch")
+            # --- Add BGP WHOIS Link ---
+            # Generate URL: https://bgp.he.net/ip/<IP>#_whois
+            if 'Prefix' in view_df.columns:
+                view_df['whois_url'] = view_df['Prefix'].apply(
+                    lambda x: f"https://bgp.he.net/ip/{x.split('/')[0]}#_whois" if isinstance(x, str) else None
+                )
+
+            st.dataframe(
+                view_df, 
+                width="stretch",
+                column_config={
+                    "whois_url": st.column_config.LinkColumn(
+                        "BGP WHOIS",
+                        display_text="WHOIS"
+                    )
+                }
+            )
             st.caption(f"Showing {len(view_df)} rows")
             
         with tab2:
