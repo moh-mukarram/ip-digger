@@ -25,7 +25,7 @@ if 'filter_country' not in st.session_state:
 if 'filter_score' not in st.session_state:
     st.session_state.filter_score = (0, 100)
 
-# Sort Persistence (Multi-Column).
+# Sort Persistence (Multi-Column)
 if 'sort_col_1' not in st.session_state:
     st.session_state.sort_col_1 = "Readiness_Score"
 if 'sort_asc_1' not in st.session_state:
